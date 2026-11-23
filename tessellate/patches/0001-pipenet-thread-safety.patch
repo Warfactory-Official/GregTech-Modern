@@ -1,0 +1,1008 @@
+diff --git a/src/main/java/com/gregtechceu/gtceu/api/pipenet/LevelPipeNet.java b/src/main/java/com/gregtechceu/gtceu/api/pipenet/LevelPipeNet.java
+index 3e649400f8..887d84fc01 100644
+--- a/src/main/java/com/gregtechceu/gtceu/api/pipenet/LevelPipeNet.java
++++ b/src/main/java/com/gregtechceu/gtceu/api/pipenet/LevelPipeNet.java
+@@ -13,12 +13,19 @@ import net.minecraft.world.level.ChunkPos;
+ import net.minecraft.world.level.saveddata.SavedData;
+ 
+ import java.util.*;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.locks.ReentrantLock;
+ 
+ public abstract class LevelPipeNet<NodeDataType, T extends PipeNet<NodeDataType>> extends SavedData {
+ 
++    /**
++     * Serializes every mutation of nets, chunk index and node maps (held across merges/splits). Reads are
++     * lock-free: {@link #pipeNetsByChunk} holds immutable arrays, node maps are concurrent.
++     */
++    protected final ReentrantLock lock = new ReentrantLock();
+     private final ServerLevel serverLevel;
+     protected List<T> pipeNets = new ArrayList<>();
+-    protected final Map<ChunkPos, List<T>> pipeNetsByChunk = new HashMap<>();
++    private final Map<ChunkPos, Object[]> pipeNetsByChunk = new ConcurrentHashMap<>();
+ 
+     public LevelPipeNet(ServerLevel serverLevel) {
+         this.serverLevel = serverLevel;
+@@ -46,6 +53,16 @@ public abstract class LevelPipeNet<NodeDataType, T extends PipeNet<NodeDataType>
+     }
+ 
+     public void addNode(BlockPos nodePos, NodeDataType nodeData, int mark, int openConnections, boolean isActive) {
++        lock.lock();
++        try {
++            addNodeLocked(nodePos, nodeData, mark, openConnections, isActive);
++        } finally {
++            lock.unlock();
++        }
++    }
++
++    private void addNodeLocked(BlockPos nodePos, NodeDataType nodeData, int mark, int openConnections,
++                               boolean isActive) {
+         T myPipeNet = null;
+         Node<NodeDataType> node = new Node<>(nodeData, openConnections, mark, isActive);
+         for (Direction facing : GTUtil.DIRECTIONS) {
+@@ -74,49 +91,90 @@ public abstract class LevelPipeNet<NodeDataType, T extends PipeNet<NodeDataType>
+     }
+ 
+     protected void addPipeNetToChunk(ChunkPos chunkPos, T pipeNet) {
+-        this.pipeNetsByChunk.computeIfAbsent(chunkPos, any -> new ArrayList<>()).add(pipeNet);
++        Object[] old = this.pipeNetsByChunk.get(chunkPos);
++        Object[] grown = old == null ? new Object[1] : Arrays.copyOf(old, old.length + 1);
++        grown[grown.length - 1] = pipeNet;
++        this.pipeNetsByChunk.put(chunkPos, grown);
+     }
+ 
+     protected void removePipeNetFromChunk(ChunkPos chunkPos, T pipeNet) {
+-        List<T> list = this.pipeNetsByChunk.get(chunkPos);
+-        if (list != null) list.remove(pipeNet);
+-        if (list.isEmpty()) this.pipeNetsByChunk.remove(chunkPos);
++        Object[] old = this.pipeNetsByChunk.get(chunkPos);
++        if (old == null) return;
++        int i = Arrays.asList(old).indexOf(pipeNet);
++        if (i < 0) return;
++        if (old.length == 1) {
++            this.pipeNetsByChunk.remove(chunkPos);
++            return;
++        }
++        Object[] shrunk = new Object[old.length - 1];
++        System.arraycopy(old, 0, shrunk, 0, i);
++        System.arraycopy(old, i + 1, shrunk, i, old.length - i - 1);
++        this.pipeNetsByChunk.put(chunkPos, shrunk);
++    }
++
++    /** Snapshot; never null. */
++    @SuppressWarnings("unchecked")
++    protected final List<T> getPipeNetsInChunk(ChunkPos chunkPos) {
++        Object[] nets = pipeNetsByChunk.get(chunkPos);
++        return nets == null ? List.of() : (List<T>) (List<?>) Arrays.asList(nets);
+     }
+ 
+     public void removeNode(BlockPos nodePos) {
+-        T pipeNet = getNetFromPos(nodePos);
+-        if (pipeNet != null) {
+-            pipeNet.removeNode(nodePos);
++        lock.lock();
++        try {
++            T pipeNet = getNetFromPos(nodePos);
++            if (pipeNet != null) {
++                pipeNet.removeNode(nodePos);
++            }
++        } finally {
++            lock.unlock();
+         }
+     }
+ 
+     public void updateBlockedConnections(BlockPos nodePos, Direction side, boolean isBlocked) {
+-        T pipeNet = getNetFromPos(nodePos);
+-        if (pipeNet != null) {
+-            pipeNet.updateBlockedConnections(nodePos, side, isBlocked);
+-            pipeNet.onPipeConnectionsUpdate();
++        lock.lock();
++        try {
++            T pipeNet = getNetFromPos(nodePos);
++            if (pipeNet != null) {
++                pipeNet.updateBlockedConnections(nodePos, side, isBlocked);
++                pipeNet.onPipeConnectionsUpdate();
++            }
++        } finally {
++            lock.unlock();
+         }
+     }
+ 
+     public void updateData(BlockPos nodePos, NodeDataType data) {
+-        T pipeNet = getNetFromPos(nodePos);
+-        if (pipeNet != null) {
+-            pipeNet.updateNodeData(nodePos, data);
++        lock.lock();
++        try {
++            T pipeNet = getNetFromPos(nodePos);
++            if (pipeNet != null) {
++                pipeNet.updateNodeData(nodePos, data);
++            }
++        } finally {
++            lock.unlock();
+         }
+     }
+ 
+     public void updateMark(BlockPos nodePos, int newMark) {
+-        T pipeNet = getNetFromPos(nodePos);
+-        if (pipeNet != null) {
+-            pipeNet.updateMark(nodePos, newMark);
++        lock.lock();
++        try {
++            T pipeNet = getNetFromPos(nodePos);
++            if (pipeNet != null) {
++                pipeNet.updateMark(nodePos, newMark);
++            }
++        } finally {
++            lock.unlock();
+         }
+     }
+ 
++    @SuppressWarnings("unchecked")
+     public T getNetFromPos(BlockPos blockPos) {
+-        List<T> pipeNetsInChunk = pipeNetsByChunk.getOrDefault(new ChunkPos(blockPos), Collections.emptyList());
+-        for (T pipeNet : pipeNetsInChunk) {
+-            if (pipeNet.containsNode(blockPos))
+-                return pipeNet;
++        Object[] nets = pipeNetsByChunk.get(new ChunkPos(blockPos));
++        if (nets == null) return null;
++        for (Object net : nets) {
++            if (((T) net).containsNode(blockPos))
++                return (T) net;
+         }
+         return null;
+     }
+@@ -143,9 +201,14 @@ public abstract class LevelPipeNet<NodeDataType, T extends PipeNet<NodeDataType>
+     @Override
+     public CompoundTag save(CompoundTag compound, HolderLookup.Provider provider) {
+         ListTag allPipeNets = new ListTag();
+-        for (T pipeNet : pipeNets) {
+-            CompoundTag pNetTag = pipeNet.serializeNBT(provider);
+-            allPipeNets.add(pNetTag);
++        lock.lock();
++        try {
++            for (T pipeNet : pipeNets) {
++                CompoundTag pNetTag = pipeNet.serializeNBT(provider);
++                allPipeNets.add(pNetTag);
++            }
++        } finally {
++            lock.unlock();
+         }
+         compound.put("PipeNets", allPipeNets);
+         return compound;
+diff --git a/src/main/java/com/gregtechceu/gtceu/api/pipenet/PipeNet.java b/src/main/java/com/gregtechceu/gtceu/api/pipenet/PipeNet.java
+index 344e8126ff..a6fe89f4de 100644
+--- a/src/main/java/com/gregtechceu/gtceu/api/pipenet/PipeNet.java
++++ b/src/main/java/com/gregtechceu/gtceu/api/pipenet/PipeNet.java
+@@ -19,11 +19,13 @@ import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
+ 
+ import java.util.*;
+ import java.util.Map.Entry;
++import java.util.concurrent.ConcurrentHashMap;
+ 
+ public abstract class PipeNet<NodeDataType> implements INBTSerializable<CompoundTag> {
+ 
+     protected final LevelPipeNet<NodeDataType, PipeNet<NodeDataType>> worldData;
+-    private final Map<BlockPos, Node<NodeDataType>> nodeByBlockPos = new HashMap<>();
++    /** Written under {@code worldData.lock}; read lock-free by walkers and net lookups. */
++    private final Map<BlockPos, Node<NodeDataType>> nodeByBlockPos = new ConcurrentHashMap<>();
+     private final Map<BlockPos, Node<NodeDataType>> unmodifiableNodeByBlockPos = Collections
+             .unmodifiableMap(nodeByBlockPos);
+     private final Object2IntOpenHashMap<ChunkPos> ownedChunks = new Object2IntOpenHashMap<>();
+@@ -113,9 +115,14 @@ public abstract class PipeNet<NodeDataType> implements INBTSerializable<Compound
+     }
+ 
+     public void removeNode(BlockPos nodePos) {
+-        if (nodeByBlockPos.containsKey(nodePos)) {
+-            Node<NodeDataType> selfNode = removeNodeWithoutRebuilding(nodePos);
+-            rebuildNetworkOnNodeRemoval(nodePos, selfNode);
++        worldData.lock.lock();
++        try {
++            if (nodeByBlockPos.containsKey(nodePos)) {
++                Node<NodeDataType> selfNode = removeNodeWithoutRebuilding(nodePos);
++                rebuildNetworkOnNodeRemoval(nodePos, selfNode);
++            }
++        } finally {
++            worldData.lock.unlock();
+         }
+     }
+ 
+@@ -139,6 +146,15 @@ public abstract class PipeNet<NodeDataType> implements INBTSerializable<Compound
+     }
+ 
+     public void updateBlockedConnections(BlockPos nodePos, Direction facing, boolean isBlocked) {
++        worldData.lock.lock();
++        try {
++            updateBlockedConnectionsLocked(nodePos, facing, isBlocked);
++        } finally {
++            worldData.lock.unlock();
++        }
++    }
++
++    private void updateBlockedConnectionsLocked(BlockPos nodePos, Direction facing, boolean isBlocked) {
+         if (!containsNode(nodePos)) {
+             return;
+         }
+@@ -194,15 +210,29 @@ public abstract class PipeNet<NodeDataType> implements INBTSerializable<Compound
+     }
+ 
+     public void updateNodeData(BlockPos nodePos, NodeDataType data) {
+-        if (containsNode(nodePos)) {
+-            Node<NodeDataType> selfNode = getNodeAt(nodePos);
+-            selfNode.data = data;
+-            onNodeDataUpdate();
+-            worldData.setDirty();
++        worldData.lock.lock();
++        try {
++            if (containsNode(nodePos)) {
++                Node<NodeDataType> selfNode = getNodeAt(nodePos);
++                selfNode.data = data;
++                onNodeDataUpdate();
++                worldData.setDirty();
++            }
++        } finally {
++            worldData.lock.unlock();
+         }
+     }
+ 
+     public void updateMark(BlockPos nodePos, int newMark) {
++        worldData.lock.lock();
++        try {
++            updateMarkLocked(nodePos, newMark);
++        } finally {
++            worldData.lock.unlock();
++        }
++    }
++
++    private void updateMarkLocked(BlockPos nodePos, int newMark) {
+         if (!containsNode(nodePos)) {
+             return;
+         }
+@@ -262,13 +292,20 @@ public abstract class PipeNet<NodeDataType> implements INBTSerializable<Compound
+     }
+ 
+     public boolean markNodeAsActive(BlockPos nodePos, boolean isActive) {
+-        if (containsNode(nodePos) && getNodeAt(nodePos).isActive != isActive) {
+-            getNodeAt(nodePos).isActive = isActive;
+-            worldData.setDirty();
+-            onNodeConnectionsUpdate();
+-            return true;
++        Node<NodeDataType> node = nodeByBlockPos.get(nodePos);
++        if (node == null || node.isActive == isActive) return false;
++        worldData.lock.lock();
++        try {
++            if (containsNode(nodePos) && getNodeAt(nodePos).isActive != isActive) {
++                getNodeAt(nodePos).isActive = isActive;
++                worldData.setDirty();
++                onNodeConnectionsUpdate();
++                return true;
++            }
++            return false;
++        } finally {
++            worldData.lock.unlock();
+         }
+-        return false;
+     }
+ 
+     protected final void uniteNetworks(PipeNet<NodeDataType> unitedPipeNet) {
+diff --git a/src/main/java/com/gregtechceu/gtceu/api/pipenet/RouteCache.java b/src/main/java/com/gregtechceu/gtceu/api/pipenet/RouteCache.java
+new file mode 100644
+index 0000000000..999386690d
+--- /dev/null
++++ b/src/main/java/com/gregtechceu/gtceu/api/pipenet/RouteCache.java
+@@ -0,0 +1,23 @@
++package com.gregtechceu.gtceu.api.pipenet;
++
++import net.minecraft.core.BlockPos;
++
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * Per-net route cache. {@link #map()} once per lookup and put into that snapshot: a put racing {@link #clear()}
++ * lands in the discarded map, never re-caching stale routes.
++ */
++public final class RouteCache<V> {
++
++    private volatile Map<BlockPos, V> map = new ConcurrentHashMap<>();
++
++    public Map<BlockPos, V> map() {
++        return map;
++    }
++
++    public void clear() {
++        map = new ConcurrentHashMap<>();
++    }
++}
+diff --git a/src/main/java/com/gregtechceu/gtceu/api/pipenet/TickableLevelPipeNet.java b/src/main/java/com/gregtechceu/gtceu/api/pipenet/TickableLevelPipeNet.java
+index 7aefbed40a..c71cbc14e5 100644
+--- a/src/main/java/com/gregtechceu/gtceu/api/pipenet/TickableLevelPipeNet.java
++++ b/src/main/java/com/gregtechceu/gtceu/api/pipenet/TickableLevelPipeNet.java
+@@ -15,8 +15,11 @@ public abstract class TickableLevelPipeNet<NodeDataType, T extends PipeNet<NodeD
+                                           extends LevelPipeNet<NodeDataType, T> {
+ 
+     private final Map<T, List<ChunkPos>> loadedChunksByPipeNet = new HashMap<>();
++    /** Guarded by {@code lock}. */
+     private final Set<T> tickingPipeNets = new HashSet<>();
+-    private final Set<T> removeLater = new HashSet<>();
++    private volatile boolean tickingDirty;
++    /** Owned by the {@link #update()} thread; rebuilt from {@link #tickingPipeNets} when dirty. */
++    private List<T> tickSnapshot = List.of();
+ 
+     public TickableLevelPipeNet(ServerLevel serverLevel) {
+         super(serverLevel);
+@@ -35,40 +38,53 @@ public abstract class TickableLevelPipeNet<NodeDataType, T extends PipeNet<NodeD
+     protected abstract int getUpdateRate();
+ 
+     public void update() {
+-        if (getWorld().getGameTime() % getUpdateRate() == 0L) {
+-            tickingPipeNets.forEach(ITickablePipeNet::update);
++        if (tickingDirty) {
++            lock.lock();
++            try {
++                tickingDirty = false;
++                tickSnapshot = List.copyOf(tickingPipeNets);
++            } finally {
++                lock.unlock();
++            }
+         }
+-        if (removeLater.size() > 0) {
+-            removeLater.forEach(tickingPipeNets::remove);
+-            removeLater.clear();
++        if (getWorld().getGameTime() % getUpdateRate() == 0L) {
++            tickSnapshot.forEach(ITickablePipeNet::update);
+         }
+     }
+ 
+     public void onChunkLoaded(ChunkAccess chunk) {
+         ChunkPos chunkPos = chunk.getPos();
+-        List<T> pipeNetsInThisChunk = this.pipeNetsByChunk.get(chunkPos);
+-        if (pipeNetsInThisChunk == null) return;
+-        for (T pipeNet : pipeNetsInThisChunk) {
+-            List<ChunkPos> loadedChunks = getOrCreateChunkListForPipeNet(pipeNet);
+-            if (loadedChunks.isEmpty()) {
+-                this.tickingPipeNets.add(pipeNet);
++        lock.lock();
++        try {
++            List<T> pipeNetsInThisChunk = getPipeNetsInChunk(chunkPos);
++            for (T pipeNet : pipeNetsInThisChunk) {
++                List<ChunkPos> loadedChunks = getOrCreateChunkListForPipeNet(pipeNet);
++                if (loadedChunks.isEmpty()) {
++                    addToTicking(pipeNet);
++                }
++                loadedChunks.add(chunkPos);
+             }
+-            loadedChunks.add(chunkPos);
++        } finally {
++            lock.unlock();
+         }
+     }
+ 
+     public void onChunkUnloaded(ChunkAccess chunk) {
+         ChunkPos chunkPos = chunk.getPos();
+-        List<T> pipeNetsInThisChunk = this.pipeNetsByChunk.get(chunkPos);
+-        if (pipeNetsInThisChunk == null) return;
+-        for (T pipeNet : pipeNetsInThisChunk) {
+-            List<ChunkPos> loadedChunks = this.loadedChunksByPipeNet.get(pipeNet);
+-            if (loadedChunks != null && loadedChunks.contains(chunkPos)) {
+-                loadedChunks.remove(chunkPos);
+-                if (loadedChunks.isEmpty()) {
+-                    removeFromTicking(pipeNet);
++        lock.lock();
++        try {
++            List<T> pipeNetsInThisChunk = getPipeNetsInChunk(chunkPos);
++            for (T pipeNet : pipeNetsInThisChunk) {
++                List<ChunkPos> loadedChunks = this.loadedChunksByPipeNet.get(pipeNet);
++                if (loadedChunks != null && loadedChunks.contains(chunkPos)) {
++                    loadedChunks.remove(chunkPos);
++                    if (loadedChunks.isEmpty()) {
++                        removeFromTicking(pipeNet);
++                    }
+                 }
+             }
++        } finally {
++            lock.unlock();
+         }
+     }
+ 
+@@ -80,7 +96,7 @@ public abstract class TickableLevelPipeNet<NodeDataType, T extends PipeNet<NodeD
+                 .filter(pair -> !pair.getRight().isEmpty())
+                 .collect(Collectors.toMap(Pair::getLeft, Pair::getRight));
+         if (!pipeNetByLoadedChunks.isEmpty()) {
+-            this.tickingPipeNets.addAll(pipeNetByLoadedChunks.keySet());
++            pipeNetByLoadedChunks.keySet().forEach(this::addToTicking);
+             this.loadedChunksByPipeNet.putAll(pipeNetByLoadedChunks);
+         }
+     }
+@@ -91,7 +107,7 @@ public abstract class TickableLevelPipeNet<NodeDataType, T extends PipeNet<NodeD
+         List<ChunkPos> loadedChunks = getPipeNetLoadedChunks(pipeNet);
+         if (!loadedChunks.isEmpty()) {
+             this.loadedChunksByPipeNet.put(pipeNet, loadedChunks);
+-            this.tickingPipeNets.add(pipeNet);
++            addToTicking(pipeNet);
+         }
+     }
+ 
+@@ -109,9 +125,15 @@ public abstract class TickableLevelPipeNet<NodeDataType, T extends PipeNet<NodeD
+         }
+     }
+ 
++    private void addToTicking(T pipeNet) {
++        tickingPipeNets.add(pipeNet);
++        tickingDirty = true;
++    }
++
+     private void removeFromTicking(T pipeNet) {
+         this.loadedChunksByPipeNet.remove(pipeNet);
+-        this.removeLater.add(pipeNet);
++        tickingPipeNets.remove(pipeNet);
++        tickingDirty = true;
+     }
+ 
+     private List<ChunkPos> getOrCreateChunkListForPipeNet(T pipeNet) {
+@@ -124,7 +146,7 @@ public abstract class TickableLevelPipeNet<NodeDataType, T extends PipeNet<NodeD
+         if (isChunkLoaded(chunkPos)) {
+             List<ChunkPos> loadedChunks = getOrCreateChunkListForPipeNet(pipeNet);
+             if (loadedChunks.isEmpty()) {
+-                this.tickingPipeNets.add(pipeNet);
++                addToTicking(pipeNet);
+             }
+             loadedChunks.add(chunkPos);
+         }
+diff --git a/src/main/java/com/gregtechceu/gtceu/common/pipelike/cable/EnergyNet.java b/src/main/java/com/gregtechceu/gtceu/common/pipelike/cable/EnergyNet.java
+index 2b9931a5d0..02983c5205 100644
+--- a/src/main/java/com/gregtechceu/gtceu/common/pipelike/cable/EnergyNet.java
++++ b/src/main/java/com/gregtechceu/gtceu/common/pipelike/cable/EnergyNet.java
+@@ -4,6 +4,7 @@ import com.gregtechceu.gtceu.api.data.chemical.material.properties.WirePropertie
+ import com.gregtechceu.gtceu.api.pipenet.LevelPipeNet;
+ import com.gregtechceu.gtceu.api.pipenet.Node;
+ import com.gregtechceu.gtceu.api.pipenet.PipeNet;
++import com.gregtechceu.gtceu.api.pipenet.RouteCache;
+ 
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.nbt.CompoundTag;
+@@ -13,7 +14,7 @@ import java.util.*;
+ 
+ public class EnergyNet extends PipeNet<WireProperties> {
+ 
+-    private final Map<BlockPos, List<EnergyRoutePath>> NET_DATA = new HashMap<>();
++    private final RouteCache<List<EnergyRoutePath>> NET_DATA = new RouteCache<>();
+ 
+     private long lastEnergyFluxPerSec;
+     private long energyFluxPerSec;
+@@ -24,7 +25,8 @@ public class EnergyNet extends PipeNet<WireProperties> {
+     }
+ 
+     public List<EnergyRoutePath> getNetData(BlockPos pipePos) {
+-        List<EnergyRoutePath> data = NET_DATA.get(pipePos);
++        var cache = NET_DATA.map();
++        List<EnergyRoutePath> data = cache.get(pipePos);
+         if (data == null) {
+             data = EnergyNetWalker.createNetData(this, pipePos);
+             if (data == null) {
+@@ -32,7 +34,7 @@ public class EnergyNet extends PipeNet<WireProperties> {
+                 return Collections.emptyList();
+             }
+             data.sort(Comparator.comparingInt(EnergyRoutePath::getDistance));
+-            NET_DATA.put(pipePos, data);
++            cache.put(pipePos, data);
+         }
+         return data;
+     }
+diff --git a/src/main/java/com/gregtechceu/gtceu/common/pipelike/duct/DuctPipeNet.java b/src/main/java/com/gregtechceu/gtceu/common/pipelike/duct/DuctPipeNet.java
+index 26d7247ed6..cd0f861895 100644
+--- a/src/main/java/com/gregtechceu/gtceu/common/pipelike/duct/DuctPipeNet.java
++++ b/src/main/java/com/gregtechceu/gtceu/common/pipelike/duct/DuctPipeNet.java
+@@ -3,6 +3,7 @@ package com.gregtechceu.gtceu.common.pipelike.duct;
+ import com.gregtechceu.gtceu.api.pipenet.LevelPipeNet;
+ import com.gregtechceu.gtceu.api.pipenet.Node;
+ import com.gregtechceu.gtceu.api.pipenet.PipeNet;
++import com.gregtechceu.gtceu.api.pipenet.RouteCache;
+ 
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.core.Direction;
+@@ -12,21 +13,22 @@ import java.util.*;
+ 
+ public class DuctPipeNet extends PipeNet<DuctPipeProperties> {
+ 
+-    private final Map<BlockPos, List<DuctRoutePath>> NET_DATA = new HashMap<>();
++    private final RouteCache<List<DuctRoutePath>> NET_DATA = new RouteCache<>();
+ 
+     public DuctPipeNet(LevelPipeNet<DuctPipeProperties, ? extends PipeNet<DuctPipeProperties>> world) {
+         super(world);
+     }
+ 
+     public List<DuctRoutePath> getNetData(BlockPos pipePos, Direction facing) {
+-        List<DuctRoutePath> data = NET_DATA.get(pipePos);
++        var cache = NET_DATA.map();
++        List<DuctRoutePath> data = cache.get(pipePos);
+         if (data == null) {
+             data = DuctNetWalker.createNetData(this, pipePos, facing);
+             if (data == null) {
+                 // walker failed, don't cache so it tries again on next insertion
+                 return Collections.emptyList();
+             }
+-            NET_DATA.put(pipePos, data);
++            cache.put(pipePos, data);
+         }
+         return data;
+     }
+diff --git a/src/main/java/com/gregtechceu/gtceu/common/pipelike/item/ItemPipeNet.java b/src/main/java/com/gregtechceu/gtceu/common/pipelike/item/ItemPipeNet.java
+index 7d4b95b176..f884a10238 100644
+--- a/src/main/java/com/gregtechceu/gtceu/common/pipelike/item/ItemPipeNet.java
++++ b/src/main/java/com/gregtechceu/gtceu/common/pipelike/item/ItemPipeNet.java
+@@ -4,6 +4,7 @@ import com.gregtechceu.gtceu.api.data.chemical.material.properties.ItemPipePrope
+ import com.gregtechceu.gtceu.api.pipenet.LevelPipeNet;
+ import com.gregtechceu.gtceu.api.pipenet.Node;
+ import com.gregtechceu.gtceu.api.pipenet.PipeNet;
++import com.gregtechceu.gtceu.api.pipenet.RouteCache;
+ 
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.core.Direction;
+@@ -13,23 +14,20 @@ import java.util.*;
+ 
+ public class ItemPipeNet extends PipeNet<ItemPipeProperties> {
+ 
+-    private final Map<BlockPos, List<ItemRoutePath>> NET_DATA = new HashMap<>();
+-    private final Map<BlockPos, List<ItemRoutePath>> NET_DATA_NO_RESTRICTIVE = new HashMap<>();
+-    private final Map<BlockPos, List<ItemRoutePath>> NET_DATA_ONLY_RESTRICTIVE = new HashMap<>();
++    private record Routes(List<ItemRoutePath> full, List<ItemRoutePath> nonRestricted,
++                          List<ItemRoutePath> restricted) {}
++
++    private final RouteCache<Routes> NET_DATA = new RouteCache<>();
+ 
+     public ItemPipeNet(LevelPipeNet<ItemPipeProperties, ? extends PipeNet<ItemPipeProperties>> world) {
+         super(world);
+     }
+ 
+     public List<ItemRoutePath> getNetData(BlockPos pipePos, Direction facing, ItemRoutePathSet ITEMNETSET) {
+-        List<ItemRoutePath> data = switch (ITEMNETSET) {
+-            case FULL -> NET_DATA.get(pipePos);
+-            case NONRESTRICTED -> NET_DATA_NO_RESTRICTIVE.get(pipePos);
+-            case RESTRICTED -> NET_DATA_ONLY_RESTRICTIVE.get(pipePos);
+-        };
+-
+-        if (data == null) {
+-            data = ItemNetWalker.createNetData(this, pipePos, facing);
++        var cache = NET_DATA.map();
++        Routes routes = cache.get(pipePos);
++        if (routes == null) {
++            List<ItemRoutePath> data = ItemNetWalker.createNetData(this, pipePos, facing);
+             if (data == null) {
+                 // walker failed, don't cache so it tries again on next insertion
+                 return Collections.emptyList();
+@@ -48,17 +46,14 @@ public class ItemPipeNet extends PipeNet<ItemPipeProperties> {
+                 }
+             }
+ 
+-            NET_DATA.put(pipePos, data);
+-            NET_DATA_NO_RESTRICTIVE.put(pipePos, nonRestricted);
+-            NET_DATA_ONLY_RESTRICTIVE.put(pipePos, restricted);
+-
+-            data = switch (ITEMNETSET) {
+-                case FULL -> NET_DATA.get(pipePos);
+-                case NONRESTRICTED -> NET_DATA_NO_RESTRICTIVE.get(pipePos);
+-                case RESTRICTED -> NET_DATA_ONLY_RESTRICTIVE.get(pipePos);
+-            };
++            routes = new Routes(data, nonRestricted, restricted);
++            cache.put(pipePos, routes);
+         }
+-        return data;
++        return switch (ITEMNETSET) {
++            case FULL -> routes.full();
++            case NONRESTRICTED -> routes.nonRestricted();
++            case RESTRICTED -> routes.restricted();
++        };
+     }
+ 
+     @Override
+@@ -68,8 +63,6 @@ public class ItemPipeNet extends PipeNet<ItemPipeProperties> {
+ 
+     private void clearNetData() {
+         NET_DATA.clear();
+-        NET_DATA_ONLY_RESTRICTIVE.clear();
+-        NET_DATA_NO_RESTRICTIVE.clear();
+     }
+ 
+     @Override
+diff --git a/src/main/java/com/gregtechceu/gtceu/common/pipelike/laser/LaserPipeNet.java b/src/main/java/com/gregtechceu/gtceu/common/pipelike/laser/LaserPipeNet.java
+index beb73552ce..38aa6344cc 100644
+--- a/src/main/java/com/gregtechceu/gtceu/common/pipelike/laser/LaserPipeNet.java
++++ b/src/main/java/com/gregtechceu/gtceu/common/pipelike/laser/LaserPipeNet.java
+@@ -3,23 +3,21 @@ package com.gregtechceu.gtceu.common.pipelike.laser;
+ import com.gregtechceu.gtceu.api.capability.GTCapabilityHelper;
+ import com.gregtechceu.gtceu.api.capability.ILaserContainer;
+ import com.gregtechceu.gtceu.api.pipenet.PipeNet;
++import com.gregtechceu.gtceu.api.pipenet.RouteCache;
+ 
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.core.Direction;
+ import net.minecraft.nbt.CompoundTag;
+ import net.minecraft.world.level.Level;
+ 
+-import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
+ import lombok.AllArgsConstructor;
+ import lombok.Getter;
+ import org.jetbrains.annotations.NotNull;
+ import org.jetbrains.annotations.Nullable;
+ 
+-import java.util.Map;
+-
+ public class LaserPipeNet extends PipeNet<LaserPipeProperties> {
+ 
+-    private final Map<BlockPos, LaserRoutePath> netData = new Object2ObjectOpenHashMap<>();
++    private final RouteCache<LaserRoutePath> netData = new RouteCache<>();
+ 
+     public LaserPipeNet(LevelLaserPipeNet world) {
+         super(world);
+@@ -27,15 +25,16 @@ public class LaserPipeNet extends PipeNet<LaserPipeProperties> {
+ 
+     @Nullable
+     public LaserRoutePath getNetData(BlockPos pipePos, Direction facing) {
+-        LaserRoutePath data = netData.get(pipePos);
++        var cache = netData.map();
++        LaserRoutePath data = cache.get(pipePos);
+         if (data == null) {
+             data = LaserNetWalker.createNetData(this, pipePos, facing);
+-            if (data == LaserNetWalker.FAILED_MARKER) {
++            if (data == null || data == LaserNetWalker.FAILED_MARKER) {
+                 // walker failed, don't cache, so it tries again on next insertion
+                 return null;
+             }
+ 
+-            netData.put(pipePos, data);
++            cache.put(pipePos, data);
+         }
+         return data;
+     }
+diff --git a/src/main/java/com/gregtechceu/gtceu/common/pipelike/optical/OpticalPipeNet.java b/src/main/java/com/gregtechceu/gtceu/common/pipelike/optical/OpticalPipeNet.java
+index f4b52a2a06..5d25e1d2fe 100644
+--- a/src/main/java/com/gregtechceu/gtceu/common/pipelike/optical/OpticalPipeNet.java
++++ b/src/main/java/com/gregtechceu/gtceu/common/pipelike/optical/OpticalPipeNet.java
+@@ -3,19 +3,19 @@ package com.gregtechceu.gtceu.common.pipelike.optical;
+ import com.gregtechceu.gtceu.api.pipenet.LevelPipeNet;
+ import com.gregtechceu.gtceu.api.pipenet.Node;
+ import com.gregtechceu.gtceu.api.pipenet.PipeNet;
++import com.gregtechceu.gtceu.api.pipenet.RouteCache;
+ 
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.core.Direction;
+ import net.minecraft.nbt.CompoundTag;
+ 
+-import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
+ import org.jetbrains.annotations.Nullable;
+ 
+ import java.util.Map;
+ 
+ public class OpticalPipeNet extends PipeNet<OpticalPipeProperties> {
+ 
+-    private final Map<BlockPos, OpticalRoutePath> NET_DATA = new Object2ObjectOpenHashMap<>();
++    private final RouteCache<OpticalRoutePath> NET_DATA = new RouteCache<>();
+ 
+     public OpticalPipeNet(LevelPipeNet<OpticalPipeProperties, ? extends PipeNet<OpticalPipeProperties>> world) {
+         super(world);
+@@ -23,16 +23,18 @@ public class OpticalPipeNet extends PipeNet<OpticalPipeProperties> {
+ 
+     @Nullable
+     public OpticalRoutePath getNetData(BlockPos pipePos, Direction facing) {
+-        if (NET_DATA.containsKey(pipePos)) {
+-            return NET_DATA.get(pipePos);
++        var cache = NET_DATA.map();
++        OpticalRoutePath data = cache.get(pipePos);
++        if (data != null) {
++            return data;
+         }
+-        OpticalRoutePath data = OpticalNetWalker.createNetData(this, pipePos, facing);
+-        if (data == OpticalNetWalker.FAILED_MARKER) {
++        data = OpticalNetWalker.createNetData(this, pipePos, facing);
++        if (data == null || data == OpticalNetWalker.FAILED_MARKER) {
+             // walker failed, don't cache, so it tries again on next insertion
+             return null;
+         }
+ 
+-        NET_DATA.put(pipePos, data);
++        cache.put(pipePos, data);
+         return data;
+     }
+ 
+diff --git a/src/test/java/com/gregtechceu/gtceu/threadingbench/PipeNetBench.java b/src/test/java/com/gregtechceu/gtceu/threadingbench/PipeNetBench.java
+new file mode 100644
+index 0000000000..9787b787e4
+--- /dev/null
++++ b/src/test/java/com/gregtechceu/gtceu/threadingbench/PipeNetBench.java
+@@ -0,0 +1,295 @@
++package com.gregtechceu.gtceu.threadingbench;
++
++import java.util.*;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * MC-free harness: key classes copy BlockPos/ChunkPos hash+equals. Run: {@code java PipeNetBench.java}.
++ */
++public final class PipeNetBench {
++
++    record Cp(int x, int z) {
++
++        @Override
++        public int hashCode() {
++            return (1664525 * x + 1013904223) ^ (1664525 * (z ^ -559038737) + 1013904223);
++        }
++    }
++
++    static final class Bp {
++
++        final int x, y, z;
++
++        Bp(int x, int y, int z) {
++            this.x = x;
++            this.y = y;
++            this.z = z;
++        }
++
++        @Override
++        public int hashCode() {
++            return (y + z * 31) * 31 + x;
++        }
++
++        @Override
++        public boolean equals(Object o) {
++            return o instanceof Bp b && b.x == x && b.y == y && b.z == z;
++        }
++    }
++
++    static final class Node {}
++
++    interface Net {
++
++        boolean contains(Bp p);
++    }
++
++    static final class MapNet implements Net {
++
++        final Map<Bp, Node> nodes;
++
++        MapNet(Map<Bp, Node> m) {
++            nodes = m;
++        }
++
++        public boolean contains(Bp p) {
++            return nodes.containsKey(p);
++        }
++    }
++
++    static volatile Object sink;
++
++    // ---------- V10 ----------
++    interface Lookup {
++
++        Net get(Bp p);
++    }
++
++    static Lookup oldLookup(Map<Cp, List<Net>> byChunk) {
++        return p -> {
++            for (Net n : byChunk.getOrDefault(new Cp(p.x >> 4, p.z >> 4), Collections.emptyList()))
++                if (n.contains(p)) return n;
++            return null;
++        };
++    }
++
++    static Lookup currentLookup(Map<Cp, List<Net>> byChunk) {
++        return p -> {
++            List<Net> l = byChunk.get(new Cp(p.x >> 4, p.z >> 4));
++            if (l == null) return null;
++            for (Net n : l) if (n.contains(p)) return n;
++            return null;
++        };
++    }
++
++    static Lookup indexedLookup(Map<Cp, List<Net>> byChunk) {
++        return p -> {
++            List<Net> l = byChunk.get(new Cp(p.x >> 4, p.z >> 4));
++            if (l == null) return null;
++            for (int i = 0, n = l.size(); i < n; i++) {
++                Net net = l.get(i);
++                if (net.contains(p)) return net;
++            }
++            return null;
++        };
++    }
++
++    static Lookup arrayLookup(Map<Cp, Net[]> byChunk) {
++        return p -> {
++            Net[] a = byChunk.get(new Cp(p.x >> 4, p.z >> 4));
++            if (a == null) return null;
++            for (Net n : a) if (n.contains(p)) return n;
++            return null;
++        };
++    }
++
++    static double timeLookup(Lookup l, Bp[] probes, int iters) {
++        long t0 = System.nanoTime();
++        Object acc = null;
++        for (int i = 0; i < iters; i++) {
++            Net n = l.get(probes[i & (probes.length - 1)]);
++            if (n != null) acc = n;
++        }
++        long t = System.nanoTime() - t0;
++        sink = acc;
++        return (double) t / iters;
++    }
++
++    static void v10() {
++        System.out.println("== V10 getNetFromPos ns/op (hit 1 net/chunk, hit 2nd of 2 nets, miss chunk); 1024 chunks");
++        for (int nets : new int[] { 1, 2 }) {
++            Map<Cp, List<Net>> oldM = new HashMap<>();
++            Map<Cp, List<Net>> curM = new ConcurrentHashMap<>();
++            Map<Cp, Net[]> arrM = new ConcurrentHashMap<>();
++            Map<Cp, List<Net>> arrL = new ConcurrentHashMap<>();
++            Map<Cp, List<Net>> oldMapNodes = new HashMap<>();
++            Random r = new Random(1);
++            Bp[] hit = new Bp[4096];
++            Bp[] miss = new Bp[4096];
++            int h = 0;
++            for (int cx = 0; cx < 32; cx++) {
++                for (int cz = 0; cz < 32; cz++) {
++                    List<Net> oldL = new ArrayList<>();
++                    List<Net> curL = new ArrayList<>();
++                    Net[] arr = new Net[nets];
++                    Bp target = null;
++                    for (int k = 0; k < nets; k++) {
++                        Map<Bp, Node> hm = new HashMap<>();
++                        Map<Bp, Node> cm = new ConcurrentHashMap<>();
++                        for (int i = 0; i < 20; i++) {
++                            Bp b = new Bp(cx * 16 + r.nextInt(16), 64 + k * 100, cz * 16 + r.nextInt(16));
++                            hm.put(b, new Node());
++                            cm.put(b, new Node());
++                            target = b;
++                        }
++                        oldL.add(new MapNet(hm));
++                        curL.add(new MapNet(cm));
++                        arr[k] = curL.get(k);
++                    }
++                    Cp c = new Cp(cx, cz);
++                    oldM.put(c, oldL);
++                    curM.put(c, Collections.unmodifiableList(curL));
++                    arrM.put(c, arr);
++                    arrL.put(c, curL);
++                    if (h < 4096) {
++                        hit[h] = target;
++                        miss[h] = new Bp(cx * 16 + 5000 * 16, 64, cz * 16);
++                        h++;
++                    }
++                }
++            }
++            for (int i = h; i < 4096; i++) {
++                hit[i] = hit[i - h];
++                miss[i] = miss[i - h];
++            }
++            Lookup[] ls = { oldLookup(oldM), currentLookup(curM), indexedLookup(curM), indexedLookup(arrL), arrayLookup(arrM) };
++            String[] names = { "old HashMap+List", "cur CHM+unmodList", "CHM+unmodList idx", "CHM+ArrayList idx", "CHM+array" };
++            for (int w = 0; w < 5; w++) for (Lookup l : ls) {
++                timeLookup(l, hit, 2_000_000);
++                timeLookup(l, miss, 2_000_000);
++            }
++            for (int k = 0; k < ls.length; k++) {
++                double a = 1e9, b = 1e9;
++                for (int rep = 0; rep < 7; rep++) {
++                    a = Math.min(a, timeLookup(ls[k], hit, 20_000_000));
++                    b = Math.min(b, timeLookup(ls[k], miss, 20_000_000));
++                }
++                System.out.printf("  nets/chunk=%d %-19s hit(last) %.2f  miss %.2f%n", nets, names[k], a, b);
++            }
++        }
++    }
++
++    // ---------- V11 ----------
++    static long used() {
++        for (int i = 0; i < 5; i++) {
++            System.gc();
++            try {
++                Thread.sleep(50);
++            } catch (InterruptedException e) {}
++        }
++        Runtime rt = Runtime.getRuntime();
++        return rt.totalMemory() - rt.freeMemory();
++    }
++
++    static void v11() {
++        System.out.println("== V11 nodeByBlockPos: put/get ns, bytes/entry excl. key+value objects");
++        Node shared = new Node();
++        for (int n : new int[] { 1_000, 10_000, 100_000 }) {
++            Bp[] keys = new Bp[n];
++            Random r = new Random(2);
++            for (int i = 0; i < n; i++) keys[i] = new Bp(r.nextInt(2000) - 1000, r.nextInt(64), r.nextInt(2000) - 1000);
++            for (String kind : new String[] { "HashMap", "CHM", "CHM(presized)" }) {
++                double put = 1e18, get = 1e18;
++                for (int rep = 0; rep < 15; rep++) {
++                    long t0 = System.nanoTime();
++                    Map<Bp, Node> m = make(kind, n);
++                    for (Bp k : keys) m.put(k, shared);
++                    put = Math.min(put, (double) (System.nanoTime() - t0) / n);
++                    int c = 0;
++                    t0 = System.nanoTime();
++                    for (int pass = 0; pass < 20; pass++) for (Bp k : keys) if (m.get(k) != null) c++;
++                    get = Math.min(get, (double) (System.nanoTime() - t0) / (20.0 * n));
++                    sink = c;
++                }
++                long before = used();
++                Map<Bp, Node> m = make(kind, n);
++                for (Bp k : keys) m.put(k, shared);
++                long after = used();
++                sink = m;
++                System.out.printf("  n=%-7d %-14s put %.1f ns  get %.2f ns  %.1f B/entry%n", n, kind, put, get,
++                        (double) (after - before) / n);
++            }
++        }
++    }
++
++    static Map<Bp, Node> make(String kind, int n) {
++        return switch (kind) {
++            case "HashMap" -> new HashMap<>();
++            case "CHM" -> new ConcurrentHashMap<>();
++            default -> new ConcurrentHashMap<>(n * 2);
++        };
++    }
++
++    // ---------- V12/V13/V15 ----------
++    static final class Cache {
++
++        private volatile Map<Bp, Object> map = new ConcurrentHashMap<>();
++
++        Map<Bp, Object> map() {
++            return map;
++        }
++    }
++
++    static final class Holder {
++
++        volatile boolean hasWaiting;
++        boolean plain;
++        final ArrayList<Object> waiting = new ArrayList<>();
++        final Queue<Runnable> inbox = new java.util.concurrent.ConcurrentLinkedQueue<>();
++    }
++
++    static void v12to15() {
++        System.out.println("== V12 route lookup, V13 hasWaiting, V15 inbox poll (ns/op)");
++        Cache c = new Cache();
++        Bp k = new Bp(1, 2, 3);
++        c.map.put(k, "x");
++        Map<Bp, Object> plain = new HashMap<>();
++        plain.put(k, "x");
++        Holder h = new Holder();
++        int N = 200_000_000;
++        double[] best = { 1e9, 1e9, 1e9, 1e9, 1e9, 1e9 };
++        for (int rep = 0; rep < 8; rep++) {
++            long t = System.nanoTime();
++            Object a = null;
++            for (int i = 0; i < N; i++) a = c.map().get(k);
++            best[0] = Math.min(best[0], (double) (System.nanoTime() - t) / N);
++            sink = a;
++            t = System.nanoTime();
++            for (int i = 0; i < N; i++) a = plain.get(k);
++            best[1] = Math.min(best[1], (double) (System.nanoTime() - t) / N);
++            sink = a;
++            // per-"machine tick": field read + loop work baseline
++            int cnt = 0;
++            t = System.nanoTime();
++            for (int i = 0; i < N; i++) if (h.hasWaiting) cnt++;
++            best[2] = Math.min(best[2], (double) (System.nanoTime() - t) / N);
++            t = System.nanoTime();
++            for (int i = 0; i < N; i++) if (!h.waiting.isEmpty()) cnt++;
++            best[3] = Math.min(best[3], (double) (System.nanoTime() - t) / N);
++            t = System.nanoTime();
++            Runnable r;
++            for (int i = 0; i < N; i++) if ((r = h.inbox.poll()) != null) cnt++;
++            best[4] = Math.min(best[4], (double) (System.nanoTime() - t) / N);
++            sink = cnt;
++        }
++        System.out.printf("  V12 volatile+CHM.get %.2f vs HashMap.get %.2f%n", best[0], best[1]);
++        System.out.printf("  V13 volatile boolean %.2f vs ArrayList.isEmpty %.2f%n", best[2], best[3]);
++        System.out.printf("  V15 CLQ.poll empty %.2f%n", best[4]);
++    }
++
++    public static void main(String[] a) {
++        v10();
++        v11();
++        v12to15();
++    }
++}
