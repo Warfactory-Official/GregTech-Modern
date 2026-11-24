@@ -1,0 +1,292 @@
+diff --git a/src/main/java/com/gregtechceu/gtceu/api/multiblock/MultiblockWorldSavedData.java b/src/main/java/com/gregtechceu/gtceu/api/multiblock/MultiblockWorldSavedData.java
+index e1c08c8bd2..4d9c39e0f3 100644
+--- a/src/main/java/com/gregtechceu/gtceu/api/multiblock/MultiblockWorldSavedData.java
++++ b/src/main/java/com/gregtechceu/gtceu/api/multiblock/MultiblockWorldSavedData.java
+@@ -9,13 +9,13 @@ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.world.level.ChunkPos;
+ import net.minecraft.world.level.saveddata.SavedData;
+ 
+-import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
+-
+ import java.util.*;
+ import java.util.concurrent.*;
+ 
+ public class MultiblockWorldSavedData extends SavedData {
+ 
++    private static final PatternState[] NONE = new PatternState[0];
++
+     public static MultiblockWorldSavedData getOrCreate(ServerLevel serverLevel) {
+         return serverLevel.getDataStorage()
+                 .computeIfAbsent(new Factory<MultiblockWorldSavedData>(MultiblockWorldSavedData::new,
+@@ -26,39 +26,68 @@ public class MultiblockWorldSavedData extends SavedData {
+      * Store all formed multiblocks' structure info
+      */
+     public final Map<BlockPos, Set<PatternState>> mapping;
+-    /**
+-     * Chunk pos mapping.
+-     */
+-    public final Map<ChunkPos, Set<PatternState>> chunkPosMapping;
++    /** Copy-on-write: arrays are never mutated after publish; writers hold the monitor. */
++    private final ConcurrentHashMap<ChunkPos, PatternState[]> chunkPosMapping = new ConcurrentHashMap<>();
+ 
+     private MultiblockWorldSavedData() {
+-        this.mapping = new Object2ObjectOpenHashMap<>();
+-        this.chunkPosMapping = new HashMap<>();
++        this.mapping = new ConcurrentHashMap<>();
+     }
+ 
+     private MultiblockWorldSavedData(CompoundTag tag, HolderLookup.Provider access) {
+         this();
+     }
+ 
++    /** Shared immutable snapshot; callers must not write to it. */
+     public PatternState[] getPatternsInChunk(ChunkPos chunkPos) {
+-        return chunkPosMapping.getOrDefault(chunkPos, Collections.emptySet()).toArray(PatternState[]::new);
++        PatternState[] patterns = chunkPosMapping.get(chunkPos);
++        return patterns == null ? NONE : patterns;
+     }
+ 
+-    public void addMapping(PatternState patternState) {
+-        this.mapping.computeIfAbsent(patternState.getControllerPos(), x -> new HashSet<>()).add(patternState);
++    public synchronized void addMapping(PatternState patternState) {
++        this.mapping.computeIfAbsent(patternState.getControllerPos(), x -> ConcurrentHashMap.newKeySet())
++                .add(patternState);
++        Set<ChunkPos> chunks = new HashSet<>();
+         for (long pos : patternState.getCache().keySet()) {
+-            chunkPosMapping.computeIfAbsent(new ChunkPos(BlockPos.of(pos)), c -> new HashSet<>()).add(patternState);
++            chunks.add(new ChunkPos(BlockPos.of(pos)));
++        }
++        for (ChunkPos chunk : chunks) {
++            PatternState[] old = chunkPosMapping.get(chunk);
++            if (old == null) {
++                chunkPosMapping.put(chunk, new PatternState[] { patternState });
++            } else if (indexOf(old, patternState) < 0) {
++                PatternState[] grown = Arrays.copyOf(old, old.length + 1);
++                grown[old.length] = patternState;
++                chunkPosMapping.put(chunk, grown);
++            }
+         }
+     }
+ 
+-    public void removeMapping(PatternState patternState) {
+-        this.mapping.getOrDefault(patternState.getControllerPos(), new HashSet<>()).remove(patternState);
++    public synchronized void removeMapping(PatternState patternState) {
++        var controllerSet = this.mapping.get(patternState.getControllerPos());
++        if (controllerSet != null) controllerSet.remove(patternState);
+         this.mapping.entrySet().removeIf(e -> e.getValue().isEmpty());
+ 
+-        for (var patternSet : chunkPosMapping.values()) {
+-            patternSet.remove(patternState);
++        for (var it = chunkPosMapping.entrySet().iterator(); it.hasNext();) {
++            var entry = it.next();
++            PatternState[] old = entry.getValue();
++            int i = indexOf(old, patternState);
++            if (i < 0) continue;
++            if (old.length == 1) {
++                it.remove();
++            } else {
++                PatternState[] shrunk = new PatternState[old.length - 1];
++                System.arraycopy(old, 0, shrunk, 0, i);
++                System.arraycopy(old, i + 1, shrunk, i, old.length - i - 1);
++                entry.setValue(shrunk);
++            }
++        }
++    }
++
++    private static int indexOf(PatternState[] array, PatternState patternState) {
++        for (int i = 0; i < array.length; i++) {
++            if (array[i].equals(patternState)) return i;
+         }
+-        chunkPosMapping.entrySet().removeIf(e -> e.getValue().isEmpty());
++        return -1;
+     }
+ 
+     @Override
+diff --git a/src/main/java/com/gregtechceu/gtceu/core/mixins/LevelMixin.java b/src/main/java/com/gregtechceu/gtceu/core/mixins/LevelMixin.java
+index 43a89d4f54..bc31717032 100644
+--- a/src/main/java/com/gregtechceu/gtceu/core/mixins/LevelMixin.java
++++ b/src/main/java/com/gregtechceu/gtceu/core/mixins/LevelMixin.java
+@@ -15,13 +15,12 @@ import net.minecraft.world.level.chunk.LevelChunk;
+ import org.spongepowered.asm.mixin.Final;
+ import org.spongepowered.asm.mixin.Mixin;
+ import org.spongepowered.asm.mixin.Shadow;
++import org.spongepowered.asm.mixin.Unique;
+ import org.spongepowered.asm.mixin.injection.At;
+ import org.spongepowered.asm.mixin.injection.Inject;
+ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+ 
+-import java.util.Set;
+-
+ @Mixin(Level.class)
+ public abstract class LevelMixin implements LevelAccessor {
+ 
+@@ -61,6 +60,9 @@ public abstract class LevelMixin implements LevelAccessor {
+         }
+     }
+ 
++    @Unique
++    private MultiblockWorldSavedData gtceu$multiblocks;
++
+     @SuppressWarnings("ConstantValue")
+     @Inject(method = "markAndNotifyBlock",
+             at = @At(value = "INVOKE",
+@@ -72,12 +74,19 @@ public abstract class LevelMixin implements LevelAccessor {
+                                               CallbackInfo ci) {
+         if (!(((Object) this) instanceof ServerLevel serverLevel)) return;
+ 
+-        MultiblockWorldSavedData mwsd = MultiblockWorldSavedData.getOrCreate(serverLevel);
+-        Set<PatternState> defensiveCopy = Set.of(mwsd.getPatternsInChunk(chunk.getPos()));
+-        for (PatternState patternState : defensiveCopy) {
++        MultiblockWorldSavedData mwsd = gtceu$multiblocks;
++        if (mwsd == null) gtceu$multiblocks = mwsd = MultiblockWorldSavedData.getOrCreate(serverLevel);
++        PatternState[] patterns = mwsd.getPatternsInChunk(chunk.getPos());
++        for (PatternState patternState : patterns) {
+             if (patternState.getCache().containsKey(pos.asLong())) {
+-                serverLevel.getServer()
+-                        .executeBlocking(() -> patternState.onBlockStateChanged(pos, oldState, newState));
++                var server = serverLevel.getServer();
++                if (server.isSameThread()) {
++                    patternState.onBlockStateChanged(pos, oldState, newState);
++                } else {
++                    // pos may be a MutableBlockPos
++                    BlockPos frozen = pos.immutable();
++                    server.execute(() -> patternState.onBlockStateChanged(frozen, oldState, newState));
++                }
+             }
+         }
+     }
+diff --git a/src/test/java/com/gregtechceu/gtceu/threadingbench/MultiblockIndexBench.java b/src/test/java/com/gregtechceu/gtceu/threadingbench/MultiblockIndexBench.java
+new file mode 100644
+index 0000000000..7d20d23465
+--- /dev/null
++++ b/src/test/java/com/gregtechceu/gtceu/threadingbench/MultiblockIndexBench.java
+@@ -0,0 +1,128 @@
++package com.gregtechceu.gtceu.threadingbench;
++
++import java.util.*;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.function.Supplier;
++
++/**
++ * MC-free harness for the per-block-change multiblock chunk lookup. Run: {@code java MultiblockIndexBench.java}.
++ */
++public final class MultiblockIndexBench {
++
++    record Cp(int x, int z) {
++
++        @Override
++        public int hashCode() {
++            return (1664525 * x + 1013904223) ^ (1664525 * (z ^ -559038737) + 1013904223);
++        }
++    }
++
++    static final class Pattern {
++
++        final Map<Long, Object> cache = new HashMap<>();
++    }
++
++    record Factory(Supplier<Object> a, Supplier<Object> b) {}
++
++    static final Object STORAGE_VALUE = new Object();
++    static final Map<String, Object> dataStorage = new HashMap<>();
++    static final Pattern[] NONE = new Pattern[0];
++    static volatile long sink;
++
++    // vanilla-original: HashMap + toArray + Set.of per call, storage lookup per call
++    static final Map<Cp, Set<Pattern>> origIdx = new HashMap<>();
++    // patched-before: CHM + keyset
++    static final Map<Cp, Set<Pattern>> curIdx = new ConcurrentHashMap<>();
++    // new: CHM<Cp, array>, cached storage
++    static final Map<Cp, Pattern[]> newIdx = new ConcurrentHashMap<>();
++    static Object cachedStorage;
++
++    static Object getOrCreate() {
++        Factory f = new Factory(() -> STORAGE_VALUE, () -> STORAGE_VALUE);
++        Object o = dataStorage.get("gtceu_multiblock");
++        return o != null ? o : f.a().get();
++    }
++
++    static long orig(Cp c, long pos) {
++        getOrCreate();
++        Set<Pattern> copy = Set.of(origIdx.getOrDefault(c, Collections.emptySet()).toArray(Pattern[]::new));
++        long hits = 0;
++        for (Pattern p : copy) if (p.cache.containsKey(pos)) hits++;
++        return hits;
++    }
++
++    static long cur(Cp c, long pos) {
++        getOrCreate();
++        long hits = 0;
++        for (Pattern p : curIdx.getOrDefault(c, Collections.emptySet()).toArray(Pattern[]::new))
++            if (p.cache.containsKey(pos)) hits++;
++        return hits;
++    }
++
++    static long neu(Cp c, long pos) {
++        Object s = cachedStorage;
++        if (s == null) cachedStorage = s = getOrCreate();
++        Pattern[] ps = newIdx.get(c);
++        if (ps == null) return 0;
++        long hits = 0;
++        for (Pattern p : ps) if (p.cache.containsKey(pos)) hits++;
++        return hits;
++    }
++
++    interface Fn {
++
++        long run(Cp c, long pos);
++    }
++
++    static double time(Fn f, Cp[] cps, int iters) {
++        long t0 = System.nanoTime();
++        long acc = 0;
++        for (int i = 0; i < iters; i++) acc += f.run(cps[i & 1023], i);
++        long t = System.nanoTime() - t0;
++        sink = acc;
++        return (double) t / iters;
++    }
++
++    public static void main(String[] a) {
++        dataStorage.put("gtceu_multiblock", STORAGE_VALUE);
++        Random r = new Random(3);
++        Cp[] empty = new Cp[1024];
++        Cp[] busy = new Cp[1024];
++        for (int i = 0; i < 1024; i++) {
++            empty[i] = new Cp(i, 5000);
++            busy[i] = new Cp(i, 0);
++        }
++        // 1024 chunks, each with 2 patterns of 30 cached positions
++        for (Cp c : busy) {
++            Set<Pattern> o = new HashSet<>(), k = ConcurrentHashMap.newKeySet();
++            Pattern[] arr = new Pattern[2];
++            for (int i = 0; i < 2; i++) {
++                Pattern p = new Pattern();
++                for (int j = 0; j < 30; j++) p.cache.put(r.nextLong(), STORAGE_VALUE);
++                o.add(p);
++                k.add(p);
++                arr[i] = p;
++            }
++            origIdx.put(c, o);
++            curIdx.put(c, k);
++            newIdx.put(c, arr);
++        }
++        // dirty world: 1 chunk with patterns among 1024 empty-chunk probes uses empty[]; map holds 1024 entries
++        Fn[] fs = { MultiblockIndexBench::orig, MultiblockIndexBench::cur, MultiblockIndexBench::neu };
++        String[] names = { "original (HashMap+Set.of+storage lookup)", "patched-before (CHM keyset toArray)",
++                "new (CHM array, cached storage)" };
++        for (int w = 0; w < 6; w++) for (Fn f : fs) {
++            time(f, empty, 2_000_000);
++            time(f, busy, 2_000_000);
++        }
++        System.out.println("== V14 per block change ns/op (no-pattern chunk | chunk with 2 patterns, pos not in cache)");
++        for (int k = 0; k < fs.length; k++) {
++            double e = 1e9, b = 1e9;
++            for (int rep = 0; rep < 9; rep++) {
++                e = Math.min(e, time(fs[k], empty, 20_000_000));
++                b = Math.min(b, time(fs[k], busy, 20_000_000));
++            }
++            System.out.printf("  %-42s %.2f | %.2f%n", names[k], e, b);
++        }
++    }
++}

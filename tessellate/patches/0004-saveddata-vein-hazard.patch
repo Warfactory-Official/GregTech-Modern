@@ -1,0 +1,231 @@
+diff --git a/src/main/java/com/gregtechceu/gtceu/api/data/worldgen/bedrockfluid/BedrockFluidVeinSavedData.java b/src/main/java/com/gregtechceu/gtceu/api/data/worldgen/bedrockfluid/BedrockFluidVeinSavedData.java
+index cd5730003b..58a61f93c2 100644
+--- a/src/main/java/com/gregtechceu/gtceu/api/data/worldgen/bedrockfluid/BedrockFluidVeinSavedData.java
++++ b/src/main/java/com/gregtechceu/gtceu/api/data/worldgen/bedrockfluid/BedrockFluidVeinSavedData.java
+@@ -59,7 +59,7 @@ public class BedrockFluidVeinSavedData extends SavedData {
+     }
+ 
+     @Override
+-    public CompoundTag save(CompoundTag nbt, HolderLookup.Provider provider) {
++    public synchronized CompoundTag save(CompoundTag nbt, HolderLookup.Provider provider) {
+         var oilList = new ListTag();
+         for (var entry : veinFluids.entrySet()) {
+             var tag = new CompoundTag();
+@@ -82,7 +82,7 @@ public class BedrockFluidVeinSavedData extends SavedData {
+      * @param chunkZ Z coordinate of desired chunk
+      * @return The FluidVeinWorldInfo corresponding with the given chunk
+      */
+-    public @Nullable FluidVeinWorldEntry getFluidVeinWorldEntry(int chunkX, int chunkZ) {
++    public synchronized @Nullable FluidVeinWorldEntry getFluidVeinWorldEntry(int chunkX, int chunkZ) {
+         ChunkPos pos = new ChunkPos(chunkX, chunkZ);
+         if (!veinFluids.containsKey(pos)) {
+             Holder<BedrockFluidDefinition> definition = null;
+@@ -140,7 +140,7 @@ public class BedrockFluidVeinSavedData extends SavedData {
+      * @param biome The biome type to check
+      * @return The total weight associated with the dimension/biome pair
+      */
+-    public int getTotalWeight(Holder<Biome> biome) {
++    public synchronized int getTotalWeight(Holder<Biome> biome) {
+         return biomeWeights.computeIfAbsent(biome, b -> {
+             int totalWeight = 0;
+             for (var definition : serverLevel.registryAccess().registryOrThrow(GTRegistries.Keys.BEDROCK_FLUID)) {
+@@ -214,7 +214,7 @@ public class BedrockFluidVeinSavedData extends SavedData {
+      * @param amount          the amount of fluid to deplete the vein by
+      * @param ignoreVeinStats whether to ignore the vein's depletion data, if false ignores amount
+      */
+-    public void depleteVein(int chunkX, int chunkZ, int amount, boolean ignoreVeinStats) {
++    public synchronized void depleteVein(int chunkX, int chunkZ, int amount, boolean ignoreVeinStats) {
+         FluidVeinWorldEntry info = getFluidVeinWorldEntry(chunkX, chunkZ);
+ 
+         if (ignoreVeinStats) {
+diff --git a/src/main/java/com/gregtechceu/gtceu/api/data/worldgen/bedrockore/BedrockOreVeinSavedData.java b/src/main/java/com/gregtechceu/gtceu/api/data/worldgen/bedrockore/BedrockOreVeinSavedData.java
+index 993358395d..63af79537f 100644
+--- a/src/main/java/com/gregtechceu/gtceu/api/data/worldgen/bedrockore/BedrockOreVeinSavedData.java
++++ b/src/main/java/com/gregtechceu/gtceu/api/data/worldgen/bedrockore/BedrockOreVeinSavedData.java
+@@ -61,7 +61,7 @@ public class BedrockOreVeinSavedData extends SavedData {
+     }
+ 
+     @Override
+-    public @NotNull CompoundTag save(CompoundTag nbt, HolderLookup.Provider provider) {
++    public synchronized @NotNull CompoundTag save(CompoundTag nbt, HolderLookup.Provider provider) {
+         var oreList = new ListTag();
+         for (var entry : veinOres.entrySet()) {
+             var tag = new CompoundTag();
+@@ -84,7 +84,7 @@ public class BedrockOreVeinSavedData extends SavedData {
+      * @param chunkZ Z coordinate of desired chunk
+      * @return The OreVeinWorldEntry corresponding with the given chunk
+      */
+-    public @Nullable OreVeinWorldEntry getOreVeinWorldEntry(int chunkX, int chunkZ) {
++    public synchronized @Nullable OreVeinWorldEntry getOreVeinWorldEntry(int chunkX, int chunkZ) {
+         ChunkPos pos = new ChunkPos(chunkX, chunkZ);
+         if (!veinOres.containsKey(pos)) {
+             int minDistance = ConfigHolder.INSTANCE.worldgen.oreVeins.bedrockOreDistance;
+@@ -136,7 +136,7 @@ public class BedrockOreVeinSavedData extends SavedData {
+         return veinOres.get(pos);
+     }
+ 
+-    public void createVein(ChunkPos pos, @Nullable Holder<BedrockOreDefinition> holder) {
++    public synchronized void createVein(ChunkPos pos, @Nullable Holder<BedrockOreDefinition> holder) {
+         if (holder != null) {
+             BedrockOreDefinition definition = holder.value();
+             int radius = definition.size() / 2;
+@@ -173,7 +173,7 @@ public class BedrockOreVeinSavedData extends SavedData {
+      * @param biome The biome type to check
+      * @return The total weight associated with the dimension/biome pair
+      */
+-    public int getTotalWeight(Holder<Biome> biome) {
++    public synchronized int getTotalWeight(Holder<Biome> biome) {
+         return biomeWeights.computeIfAbsent(biome, b -> {
+             int totalWeight = 0;
+             for (var definition : serverLevel.registryAccess().registryOrThrow(GTRegistries.Keys.BEDROCK_ORE)) {
+@@ -247,7 +247,7 @@ public class BedrockOreVeinSavedData extends SavedData {
+      * @param amount          the amount of fluid to deplete the vein by
+      * @param ignoreVeinStats whether to ignore the vein's depletion data, if false ignores amount
+      */
+-    public void depleteVein(int chunkX, int chunkZ, int amount, boolean ignoreVeinStats) {
++    public synchronized void depleteVein(int chunkX, int chunkZ, int amount, boolean ignoreVeinStats) {
+         OreVeinWorldEntry info = getOreVeinWorldEntry(chunkX, chunkZ);
+ 
+         if (ignoreVeinStats) {
+diff --git a/src/main/java/com/gregtechceu/gtceu/common/capability/EnvironmentalHazardSavedData.java b/src/main/java/com/gregtechceu/gtceu/common/capability/EnvironmentalHazardSavedData.java
+index 20e529d05a..c02f326826 100644
+--- a/src/main/java/com/gregtechceu/gtceu/common/capability/EnvironmentalHazardSavedData.java
++++ b/src/main/java/com/gregtechceu/gtceu/common/capability/EnvironmentalHazardSavedData.java
+@@ -31,10 +31,12 @@ import lombok.experimental.Accessors;
+ import org.jetbrains.annotations.NotNull;
+ import org.jetbrains.annotations.Nullable;
+ 
+-import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Map;
++import java.util.Queue;
+ import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentLinkedQueue;
+ import java.util.stream.Stream;
+ 
+ /**
+@@ -47,10 +49,13 @@ public class EnvironmentalHazardSavedData extends SavedData {
+     private final ServerLevel serverLevel;
+ 
+     /**
+-     * Map of source position to a triple of (trigger, material).
++     * Map of source position to a triple of (trigger, material). Single writer (server thread); concurrent for
++     * off-thread readers only.
+      */
+     @Getter
+-    private final Map<ChunkPos, HazardZone> hazardZones = new HashMap<>();
++    private final Map<ChunkPos, HazardZone> hazardZones = new ConcurrentHashMap<>();
++    /** Mutations requested off the server thread; drained at the start of {@link #tick()}. */
++    private final Queue<Runnable> inbox = new ConcurrentLinkedQueue<>();
+ 
+     public static EnvironmentalHazardSavedData getOrCreate(ServerLevel serverLevel) {
+         return serverLevel.getDataStorage()
+@@ -83,7 +88,13 @@ public class EnvironmentalHazardSavedData extends SavedData {
+         }
+     }
+ 
++    private void onOwner(Runnable op) {
++        if (serverLevel.getServer().isSameThread()) op.run();
++        else inbox.add(op);
++    }
++
+     public void tick() {
++        for (Runnable op; (op = inbox.poll()) != null;) op.run();
+         if (!ConfigHolder.INSTANCE.gameplay.environmentalHazards) {
+             return;
+         }
+@@ -116,6 +127,7 @@ public class EnvironmentalHazardSavedData extends SavedData {
+ 
+         for (ChunkPos pos : zonesToSpread) {
+             final HazardZone zone = hazardZones.get(pos);
++            if (zone == null) continue;
+             ChunkPos[] relativePositions = new ChunkPos[] {
+                     new ChunkPos(pos.x, pos.z - 1),
+                     new ChunkPos(pos.x, pos.z + 1),
+@@ -124,18 +136,16 @@ public class EnvironmentalHazardSavedData extends SavedData {
+             };
+             float removedStrength = 0;
+             for (ChunkPos relativePos : relativePositions) {
+-                hazardZones.compute(relativePos, (k, v) -> {
+-                    HazardZone newZone;
+-                    if (v != null && v.condition() == zone.condition() && v.trigger() == zone.trigger()) {
+-                        newZone = v.addStrength(20);
+-                        sendSyncZonePacket(k, newZone);
+-                    } else {
+-                        newZone = new HazardZone(k.getMiddleBlockPosition(zone.source().getY()), 20, true,
+-                                zone.trigger(), zone.condition());
+-                        sendAddZonePacket(k, newZone);
+-                    }
+-                    return newZone;
+-                });
++                HazardZone neighbour = hazardZones.get(relativePos);
++                if (neighbour != null && neighbour.condition() == zone.condition() &&
++                        neighbour.trigger() == zone.trigger()) {
++                    sendSyncZonePacket(relativePos, neighbour.addStrength(20));
++                } else {
++                    neighbour = new HazardZone(relativePos.getMiddleBlockPosition(zone.source().getY()), 20, true,
++                            zone.trigger(), zone.condition());
++                    hazardZones.put(relativePos, neighbour);
++                    sendAddZonePacket(relativePos, neighbour);
++                }
+                 removedStrength += 20;
+             }
+             HazardZone newZone = zone.removeStrength(removedStrength);
+@@ -207,17 +217,21 @@ public class EnvironmentalHazardSavedData extends SavedData {
+ 
+     public void removeZone(BlockPos inChunkPos, MedicalCondition condition) {
+         ChunkPos chunkPos = new ChunkPos(inChunkPos);
+-        if (this.hazardZones.get(chunkPos).condition() == condition) {
+-            removeZone(chunkPos);
+-        }
++        onOwner(() -> {
++            if (this.hazardZones.get(chunkPos).condition() == condition) {
++                removeZone(chunkPos);
++            }
++        });
+     }
+ 
+     public void removeZone(ChunkPos chunkPos) {
+-        this.hazardZones.remove(chunkPos);
+-        if (this.serverLevel.hasChunk(chunkPos.x, chunkPos.z)) {
+-            PacketDistributor.sendToPlayersTrackingChunk(this.serverLevel, chunkPos,
+-                    new SPacketRemoveHazardZone(chunkPos));
+-        }
++        onOwner(() -> {
++            this.hazardZones.remove(chunkPos);
++            if (this.serverLevel.hasChunk(chunkPos.x, chunkPos.z)) {
++                PacketDistributor.sendToPlayersTrackingChunk(this.serverLevel, chunkPos,
++                        new SPacketRemoveHazardZone(chunkPos));
++            }
++        });
+     }
+ 
+     public void addZone(ChunkPos source, HazardZone zone) {
+@@ -225,15 +239,17 @@ public class EnvironmentalHazardSavedData extends SavedData {
+             return;
+         }
+ 
+-        HazardZone existing = this.hazardZones.get(source);
+-        if (existing != null && existing.condition == zone.condition) {
+-            existing.addStrength(zone.strength());
+-            sendSyncZonePacket(source, existing);
+-        } else if (!this.hazardZones.containsKey(source)) {
+-            this.hazardZones.put(source, zone);
+-            sendAddZonePacket(source, zone);
+-        }
+-        this.setDirty();
++        onOwner(() -> {
++            HazardZone existing = this.hazardZones.get(source);
++            if (existing != null && existing.condition == zone.condition) {
++                existing.addStrength(zone.strength());
++                sendSyncZonePacket(source, existing);
++            } else if (existing == null) {
++                this.hazardZones.put(source, zone);
++                sendAddZonePacket(source, zone);
++            }
++            this.setDirty();
++        });
+     }
+ 
+     public void addZone(BlockPos source, float strength, boolean canSpread,

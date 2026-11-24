@@ -1,0 +1,112 @@
+diff --git a/src/main/java/com/gregtechceu/gtceu/api/blockentity/PipeBlockEntity.java b/src/main/java/com/gregtechceu/gtceu/api/blockentity/PipeBlockEntity.java
+index 70cd2e02dc..25de7f3805 100644
+--- a/src/main/java/com/gregtechceu/gtceu/api/blockentity/PipeBlockEntity.java
++++ b/src/main/java/com/gregtechceu/gtceu/api/blockentity/PipeBlockEntity.java
+@@ -83,8 +83,11 @@ public abstract class PipeBlockEntity<PipeType extends Enum<PipeType> & IPipeTyp
+     @SyncToClient
+     @SaveField
+     private @Nullable Material frameMaterial = null;
++    /** Tick thread only. */
+     private final List<TickableSubscription> serverTicks;
++    /** Guarded by itself; {@link #hasWaiting} keeps the per-tick check lock-free. */
+     private final List<TickableSubscription> waitingToAdd;
++    private volatile boolean hasWaiting;
+ 
+     public PipeBlockEntity(BlockEntityType<?> type, BlockPos pos, BlockState blockState) {
+         super(type, pos, blockState);
+@@ -181,7 +184,10 @@ public abstract class PipeBlockEntity<PipeType extends Enum<PipeType> & IPipeTyp
+     public TickableSubscription subscribeServerTick(Runnable runnable) {
+         if (!isRemote()) {
+             var subscription = new TickableSubscription(runnable);
+-            waitingToAdd.add(subscription);
++            synchronized (waitingToAdd) {
++                waitingToAdd.add(subscription);
++                hasWaiting = true;
++            }
+             return subscription;
+         }
+         return null;
+@@ -195,9 +201,12 @@ public abstract class PipeBlockEntity<PipeType extends Enum<PipeType> & IPipeTyp
+ 
+     public final void serverTick() {
+         super.serverTick();
+-        if (!waitingToAdd.isEmpty()) {
+-            serverTicks.addAll(waitingToAdd);
+-            waitingToAdd.clear();
++        if (hasWaiting) {
++            synchronized (waitingToAdd) {
++                hasWaiting = false;
++                serverTicks.addAll(waitingToAdd);
++                waitingToAdd.clear();
++            }
+         }
+         for (var iter = serverTicks.iterator(); iter.hasNext();) {
+             var tickable = iter.next();
+diff --git a/src/main/java/com/gregtechceu/gtceu/api/machine/MetaMachine.java b/src/main/java/com/gregtechceu/gtceu/api/machine/MetaMachine.java
+index 52e7076dea..99954510ba 100644
+--- a/src/main/java/com/gregtechceu/gtceu/api/machine/MetaMachine.java
++++ b/src/main/java/com/gregtechceu/gtceu/api/machine/MetaMachine.java
+@@ -131,8 +131,11 @@ public class MetaMachine extends ManagedSyncBlockEntity implements IGregtechBloc
+     @SyncToClient
+     protected final MachineTraitHolder traitHolder;
+ 
++    /** Tick thread only. */
+     private final List<TickableSubscription> serverTicks;
++    /** Guarded by itself; {@link #hasWaiting} keeps the per-tick check lock-free. */
+     private final List<TickableSubscription> waitingToAdd;
++    private volatile boolean hasWaiting;
+ 
+     public MetaMachine(BlockEntityCreationInfo info) {
+         super(info);
+@@ -197,10 +200,6 @@ public class MetaMachine extends ManagedSyncBlockEntity implements IGregtechBloc
+     public void onUnload() {
+         getAllTraits().forEach(MachineTrait::onMachineUnload);
+ 
+-        for (TickableSubscription serverTick : serverTicks) {
+-            serverTick.unsubscribe();
+-        }
+-        serverTicks.clear();
+     }
+ 
+     /**
+@@ -247,7 +246,10 @@ public class MetaMachine extends ManagedSyncBlockEntity implements IGregtechBloc
+     public TickableSubscription subscribeServerTick(Runnable runnable) {
+         if (!isRemote()) {
+             var subscription = new TickableSubscription(runnable);
+-            waitingToAdd.add(subscription);
++            synchronized (waitingToAdd) {
++                waitingToAdd.add(subscription);
++                hasWaiting = true;
++            }
+             return subscription;
+         }
+         return null;
+@@ -272,9 +274,12 @@ public class MetaMachine extends ManagedSyncBlockEntity implements IGregtechBloc
+     public void clientTick() {}
+ 
+     private void executeTick() {
+-        if (!waitingToAdd.isEmpty()) {
+-            serverTicks.addAll(waitingToAdd);
+-            waitingToAdd.clear();
++        if (hasWaiting) {
++            synchronized (waitingToAdd) {
++                hasWaiting = false;
++                serverTicks.addAll(waitingToAdd);
++                waitingToAdd.clear();
++            }
+         }
+ 
+         for (var iter = serverTicks.iterator(); iter.hasNext();) {
+diff --git a/src/main/java/com/gregtechceu/gtceu/api/machine/TickableSubscription.java b/src/main/java/com/gregtechceu/gtceu/api/machine/TickableSubscription.java
+index a284979f33..ea873cdee4 100644
+--- a/src/main/java/com/gregtechceu/gtceu/api/machine/TickableSubscription.java
++++ b/src/main/java/com/gregtechceu/gtceu/api/machine/TickableSubscription.java
+@@ -6,7 +6,7 @@ public class TickableSubscription {
+ 
+     private final Runnable runnable;
+     @Getter
+-    private boolean stillSubscribed;
++    private volatile boolean stillSubscribed;
+ 
+     public TickableSubscription(Runnable runnable) {
+         this.runnable = runnable;

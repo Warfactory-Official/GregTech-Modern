@@ -1,0 +1,15 @@
+diff --git a/src/main/java/com/gregtechceu/gtceu/core/mixins/ItemStackMixin.java b/src/main/java/com/gregtechceu/gtceu/core/mixins/ItemStackMixin.java
+index 64bf5df91c..038a3d2f4f 100644
+--- a/src/main/java/com/gregtechceu/gtceu/core/mixins/ItemStackMixin.java
++++ b/src/main/java/com/gregtechceu/gtceu/core/mixins/ItemStackMixin.java
+@@ -83,8 +83,8 @@ public abstract class ItemStackMixin implements ISpoilableItemStackExtension {
+ 
+     @Inject(at = @At("HEAD"), method = { "getItem", "getCount" })
+     private void gtceu$injectedFreshnessUpdate(CallbackInfoReturnable<Item> cir) {
+-        if (gtceu$self().getEntityRepresentation() != null)
+-            gtceu$updateFreshness(new SpoilContext(gtceu$self().getEntityRepresentation(), 0), true);
++        Entity holder = gtceu$self().getEntityRepresentation();
++        if (holder != null) gtceu$updateFreshness(new SpoilContext(holder, 0), true);
+         else gtceu$updateFreshness(new SpoilContext(), false);
+     }
+ 
